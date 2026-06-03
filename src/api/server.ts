@@ -2,14 +2,13 @@ import { Hono } from 'hono'
 import { serve } from '@hono/node-server'
 import { config } from '../core/config.js'
 import { metrics } from '../core/metrics.js'
-import { MemoryCache } from '../cache/memory-cache.js'
+import { cache } from '../cache/memory-cache.js'
 import { Watchdog } from '../core/watchdog.js'
 import { app as modelsApp } from './models.js'
 import { chatCompletions, chatCompletionsStop } from '../routes/chat.js'
 
 const app = new Hono()
 
-let cache: MemoryCache
 let watchdog: Watchdog
 let server: any
 
@@ -67,7 +66,6 @@ app.onError((err, c) => {
 app.notFound((c) => c.json({ error: 'Not found' }, 404))
 
 export async function startServer(): Promise<void> {
-  cache = new MemoryCache()
   await cache.connect()
 
   const { loadAccounts } = await import('../core/accounts.ts')

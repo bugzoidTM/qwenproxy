@@ -405,9 +405,16 @@ export async function chatCompletions(c: Context) {
       });
     }
 
+    // Disable Nagle's algorithm to transmit small chunks immediately without buffering delay
+    const socket = (c.env as any)?.incoming?.socket || (c.req.raw as any).socket;
+    if (socket && typeof socket.setNoDelay === 'function') {
+      socket.setNoDelay(true);
+    }
+
     c.header('Content-Type', 'text/event-stream');
-    c.header('Cache-Control', 'no-cache');
+    c.header('Cache-Control', 'no-cache, no-transform');
     c.header('Connection', 'keep-alive');
+    c.header('X-Accel-Buffering', 'no');
 
     return honoStream(c, async (streamWriter: any) => {
       let heartbeatInterval: any;
@@ -607,7 +614,7 @@ export async function chatCompletions(c: Context) {
 
           // Periodic yielding to prevent event loop starvation
           chunkCount++;
-          if (chunkCount % 50 === 0) {
+          if (chunkCount % 100 === 0) {
             await new Promise(r => setImmediate(r));
           }
         }

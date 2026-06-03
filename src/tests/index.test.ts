@@ -318,3 +318,39 @@ test('Chat Completions endpoint - Non-streaming (stream: false)', async () => {
     await closePlaywright();
   }
 });
+
+test('Models endpoint caching: subsequent requests return cached models without fetch', async () => {
+  const originalFetch = globalThis.fetch;
+  let fetchCount = 0;
+  globalThis.fetch = async (input: any) => {
+    const url = typeof input === 'string' ? input : input.url;
+    if (url.includes('/api/models')) {
+      fetchCount++;
+      return new Response(JSON.stringify({ data: [{ id: 'qwen3.6-plus-cached-test', owned_by: 'qwen' }] }), { status: 200 });
+    }
+    return originalFetch(input);
+  };
+
+  try {
+    const { cache } = await import('../cache/memory-cache.js');
+    await cache.flush();
+
+    // First request
+    const req1 = new Request('http://localhost/v1/models');
+    const res1 = await app.fetch(req1);
+    assert.strictEqual(res1.status, 200);
+    const body1 = await res1.json();
+    assert.ok(body1.data.some((m: any) => m.id === 'qwen3.6-plus-cached-test'));
+    assert.strictEqual(fetchCount, 1);
+
+    // Second request
+    const req2 = new Request('http://localhost/v1/models');
+    const res2 = await app.fetch(req2);
+    assert.strictEqual(res2.status, 200);
+    const body2 = await res2.json();
+    assert.ok(body2.data.some((m: any) => m.id === 'qwen3.6-plus-cached-test'));
+    assert.strictEqual(fetchCount, 1);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});

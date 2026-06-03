@@ -7,6 +7,7 @@ export type CacheKey =
   | `prompt:${string}`
   | `response:${string}`
   | `rate:${string}`
+  | `models:${string}`
 
 interface CacheEntry<T> {
   value: T
@@ -181,3 +182,5 @@ export class MemoryCache {
     this.store.clear()
   }
 }
+
+export const cache = new MemoryCache()
