@@ -137,6 +137,10 @@ async function uploadToOSS(
     endpoint,
   } = stsData;
 
+  if (process.env.TEST_MOCK_PLAYWRIGHT) {
+    return stsData.file_url.split("?")[0];
+  }
+
   const OSS = (await import("ali-oss")).default;
   const client = new OSS({
     region,
@@ -608,9 +612,40 @@ export async function processImagesForQwen(
       let fileId = "";
 
       if (mediaUrl.startsWith("http://") || mediaUrl.startsWith("https://")) {
-        fileUrl = mediaUrl;
-        filename = mediaUrl.split("/").pop()?.split("?")[0] || "file.bin";
-        fileId = uuidv4();
+        try {
+          const downloadRes = await fetch(mediaUrl);
+          if (!downloadRes.ok) {
+            console.error(`[Upload] Failed to download media: ${downloadRes.status} ${mediaUrl}`);
+            continue;
+          }
+          const buffer = Buffer.from(await downloadRes.arrayBuffer());
+          fileSize = buffer.length;
+          filename = mediaUrl.split("/").pop()?.split("?")[0] || "file.bin";
+          if (!filename.includes(".")) {
+            const mime = downloadRes.headers.get("content-type") || "";
+            const mimeExt: Record<string, string> = {
+              "image/png": "png", "image/jpeg": "jpg", "image/gif": "gif",
+              "image/webp": "webp", "video/mp4": "mp4", "video/webm": "webm",
+              "audio/mpeg": "mp3", "audio/wav": "wav", "audio/ogg": "ogg",
+              "audio/flac": "flac", "audio/mp4": "m4a", "audio/aac": "aac",
+              "application/pdf": "pdf",
+            };
+            const ext = mimeExt[mime] || "bin";
+            filename = `${filename}.${ext}`;
+          }
+          const typeInfo = detectFileType(filename);
+          const stsData = await getSTSToken(
+            filename,
+            fileSize,
+            typeInfo.qwenFileType,
+            headers,
+          );
+          fileUrl = await uploadToOSS(buffer.buffer, stsData, filename);
+          fileId = stsData.file_id;
+        } catch (err: any) {
+          console.error("[Upload] Failed to download/re-upload HTTP media:", err.message);
+          continue;
+        }
       } else if (mediaUrl.startsWith("data:")) {
         try {
           // Detect type from data URI
@@ -631,6 +666,8 @@ export async function processImagesForQwen(
             "image/jpeg": "jpg",
             "image/gif": "gif",
             "image/webp": "webp",
+            "application/pdf": "pdf",
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": "xlsx",
           };
           const detectedExt =
             extFromMime[dataMime] ||

@@ -351,19 +351,28 @@ export async function createQwenStream(
   const chatHeaders = chatEntry.headers;
   const actualParentId: string | null = null;
 
-  // Process pending multimodal uploads using warm pool headers (no extra Playwright roundtrip)
+  // Process pending multimodal uploads — requires full headers with bx-ua/bx-umidtoken
   let resolvedFiles = files || [];
   if (pendingMultimodal && pendingMultimodal.length > 0 && resolvedFiles.length === 0) {
     try {
       const { processImagesForQwen } = await import('../routes/upload.ts');
+      const { headers: fullHeaders } = await getQwenHeaders(false, accountId);
       const uploadHeaders: Record<string, string> = {
-        cookie: chatHeaders['cookie'] || '',
-        'user-agent': chatHeaders['user-agent'] || '',
-        'bx-ua': chatHeaders['bx-ua'] || '',
-        'bx-umidtoken': chatHeaders['bx-umidtoken'] || '',
-        'bx-v': chatHeaders['bx-v'] || '',
+        cookie: fullHeaders['cookie'] || chatHeaders['cookie'] || '',
+        'user-agent': fullHeaders['user-agent'] || chatHeaders['user-agent'] || '',
+        'bx-ua': fullHeaders['bx-ua'] || '',
+        'bx-umidtoken': fullHeaders['bx-umidtoken'] || '',
+        'bx-v': fullHeaders['bx-v'] || chatHeaders['bx-v'] || '',
       };
-      // Process all multimodal parts in parallel
+      if (!uploadHeaders['bx-ua']) {
+        console.warn('[Qwen] Missing bx-ua header for multimodal upload, attempting forced refresh...');
+        const { headers: refreshedHeaders } = await getQwenHeaders(true, accountId);
+        uploadHeaders['cookie'] = refreshedHeaders['cookie'] || uploadHeaders['cookie'];
+        uploadHeaders['user-agent'] = refreshedHeaders['user-agent'] || uploadHeaders['user-agent'];
+        uploadHeaders['bx-ua'] = refreshedHeaders['bx-ua'] || '';
+        uploadHeaders['bx-umidtoken'] = refreshedHeaders['bx-umidtoken'] || '';
+        uploadHeaders['bx-v'] = refreshedHeaders['bx-v'] || uploadHeaders['bx-v'];
+      }
       const results = await Promise.all(
         pendingMultimodal.map(parts => processImagesForQwen(parts, uploadHeaders))
       );
