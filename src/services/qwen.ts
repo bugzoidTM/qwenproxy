@@ -66,6 +66,9 @@ interface WarmPoolEntry {
 const warmPool: Map<string, WarmPoolEntry[]> = (globalThis as any)._warmPool || new Map();
 (globalThis as any)._warmPool = warmPool;
 
+const refillPromises: Map<string, Promise<void>> = (globalThis as any)._refillPromises || new Map();
+(globalThis as any)._refillPromises = refillPromises;
+
 const WARM_POOL_SIZE = 5;
 const WARM_POOL_TTL_MS = 10 * 60 * 1000;
 
@@ -128,15 +131,21 @@ async function refillPoolForAccount(accountId: string) {
   if (!pool) { pool = []; warmPool.set(accountId, pool); }
   cleanupStalePool(accountId);
   const need = Math.max(0, WARM_POOL_SIZE - pool.length);
-  for (let i = 0; i < need; i++) {
+  
+  const creationPromises = Array.from({ length: need }, async () => {
     try {
       const headers = await getBasicQwenHeaders(accountId === 'global' ? undefined : accountId);
       const chatId = await createRealQwenChat(headers);
-      pool.push({ chatId, headers, accountId, timestamp: Date.now() });
+      return { chatId, headers, accountId, timestamp: Date.now() };
     } catch (err) {
       console.error(`[WarmPool] refill failed for ${accountId}:`, (err as Error).message);
-      break;
+      return null;
     }
+  });
+  
+  const results = await Promise.all(creationPromises);
+  for (const entry of results) {
+    if (entry) pool.push(entry);
   }
 }
 
@@ -146,7 +155,10 @@ export async function getWarmedChat(accountId?: string) {
   if (!pool) { pool = []; warmPool.set(key, pool); }
   cleanupStalePool(key);
   if (pool.length === 0) {
-    await refillPoolForAccount(key);
+    if (!refillPromises.has(key)) {
+      refillPromises.set(key, refillPoolForAccount(key).finally(() => refillPromises.delete(key)));
+    }
+    await refillPromises.get(key);
   }
   if (pool.length === 0) throw new Error(`Warm pool empty for ${key}`);
   return pool.shift()!;

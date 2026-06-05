@@ -4,7 +4,35 @@ export interface TruncatedMessage {
 }
 
 export function estimateTokenCount(text: string): number {
-  return Math.ceil(text.length / 3.5);
+  // Divisor conservador (2.5) para evitar estouro silencioso do context window.
+  // Tokenizers modernos (como o do Qwen) usam ~1.5 a 2.5 caracteres por token
+  // para textos mistos (português, código, caracteres especiais).
+  return Math.ceil(text.length / 2.5);
+}
+
+function truncateSemantically(content: string, maxChars: number): string {
+  if (content.length <= maxChars) return content;
+  
+  const truncated = content.slice(0, maxChars);
+  
+  if (truncated.trimStart().startsWith('{') || truncated.trimStart().startsWith('[')) {
+    const lastBrace = Math.max(truncated.lastIndexOf('}'), truncated.lastIndexOf(']'));
+    if (lastBrace > maxChars * 0.7) {
+      return truncated.slice(0, lastBrace + 1) + ' /* truncated */';
+    }
+  }
+  
+  const lastNewline = truncated.lastIndexOf('\n');
+  if (lastNewline > maxChars * 0.8) {
+    return truncated.slice(0, lastNewline) + '\n[Truncated]';
+  }
+  
+  const lastSpace = truncated.lastIndexOf(' ');
+  if (lastSpace > maxChars * 0.9) {
+    return truncated.slice(0, lastSpace) + '... [Truncated]';
+  }
+  
+  return truncated + '... [Truncated]';
 }
 
 export function truncateMessages(
@@ -39,13 +67,14 @@ export function truncateMessages(
     const msgTokens = estimateTokenCount(msg.content);
     
     if (usedTokens + msgTokens <= availableTokens) {
-      result.unshift(msg);
+      result.push(msg);
       usedTokens += msgTokens;
     } else {
       const remainingTokens = availableTokens - usedTokens;
       if (remainingTokens > 100) {
-        const truncatedContent = msg.content.slice(0, remainingTokens * 3.5);
-        result.unshift({ role: msg.role, content: `[Truncated] ${truncatedContent}...` });
+        const maxChars = Math.floor(remainingTokens * 2.5);
+        const truncatedContent = truncateSemantically(msg.content, maxChars);
+        result.push({ role: msg.role, content: `[Truncated] ${truncatedContent}` });
       }
       break;
     }
@@ -53,9 +82,11 @@ export function truncateMessages(
   
   if (result.length === 0 && normalizedMessages.length > 0) {
     const lastMsg = normalizedMessages[normalizedMessages.length - 1];
-    const truncatedContent = lastMsg.content.slice(0, Math.max(200, availableTokens * 3.5));
-    result.push({ role: lastMsg.role, content: `[Truncated] ${truncatedContent}...` });
+    const maxChars = Math.max(200, Math.floor(availableTokens * 2.5));
+    const truncatedContent = truncateSemantically(lastMsg.content, maxChars);
+    result.push({ role: lastMsg.role, content: `[Truncated] ${truncatedContent}` });
   }
   
+  result.reverse();
   return result;
 }

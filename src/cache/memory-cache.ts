@@ -19,14 +19,32 @@ export class MemoryCache {
   private defaultTTL: number
   private prefix: string
   private cleanupInterval: NodeJS.Timeout | null
+  private maxEntries: number
+  private totalBytes: number
 
-  constructor(options?: { prefix?: string; defaultTTL?: number }) {
+  constructor(options?: { prefix?: string; defaultTTL?: number; maxEntries?: number }) {
     this.prefix = options?.prefix || 'qwenproxy:'
     this.defaultTTL = options?.defaultTTL || config.cache.defaultTTL
+    this.maxEntries = options?.maxEntries || 10000
     this.store = new Map()
+    this.totalBytes = 0
     this.cleanupInterval = null
 
     this.startCleanup()
+  }
+
+  private entryByteSize(key: string, value: any): number {
+    return Buffer.byteLength(key) + Buffer.byteLength(JSON.stringify(value))
+  }
+
+  private evictLRU(): void {
+    const oldest = this.store.keys().next()
+    if (!oldest.done) {
+      const evicted = this.store.get(oldest.value)
+      if (evicted) this.totalBytes -= this.entryByteSize(oldest.value, evicted.value)
+      this.store.delete(oldest.value)
+      metrics.increment('cache.evicted')
+    }
   }
 
   private startCleanup(): void {
@@ -48,11 +66,22 @@ export class MemoryCache {
     const serialized = JSON.stringify(value)
     const effectiveTTL = ttl || this.defaultTTL
     const fullKey = this.prefix + key
+    const entrySize = this.entryByteSize(fullKey, value)
+    
+    if (this.store.has(fullKey)) {
+      const oldEntry = this.store.get(fullKey)
+      if (oldEntry) this.totalBytes -= this.entryByteSize(fullKey, oldEntry.value)
+    } else {
+      while (this.store.size >= this.maxEntries) {
+        this.evictLRU()
+      }
+    }
     
     this.store.set(fullKey, {
       value,
       expiresAt: Date.now() + (effectiveTTL * 1000)
     })
+    this.totalBytes += entrySize
     
     metrics.increment('cache.set')
     metrics.histogram('cache.value.size', Buffer.byteLength(serialized))
@@ -66,10 +95,16 @@ export class MemoryCache {
     metrics.histogram('cache.get.latency', Date.now() - start)
 
     if (!entry || entry.expiresAt <= Date.now()) {
-      if (entry) this.store.delete(fullKey)
+      if (entry) {
+        this.totalBytes -= this.entryByteSize(fullKey, entry.value)
+        this.store.delete(fullKey)
+      }
       metrics.increment('cache.miss')
       return null
     }
+
+    this.store.delete(fullKey)
+    this.store.set(fullKey, entry)
 
     metrics.increment('cache.hit')
     return entry.value as T
@@ -77,15 +112,22 @@ export class MemoryCache {
 
   async delete(key: CacheKey): Promise<void> {
     const fullKey = this.prefix + key
-    this.store.delete(fullKey)
-    metrics.increment('cache.deleted')
+    const entry = this.store.get(fullKey)
+    if (entry) {
+      this.totalBytes -= this.entryByteSize(fullKey, entry.value)
+      this.store.delete(fullKey)
+      metrics.increment('cache.deleted')
+    }
   }
 
   async exists(key: CacheKey): Promise<boolean> {
     const fullKey = this.prefix + key
     const entry = this.store.get(fullKey)
     if (!entry || entry.expiresAt <= Date.now()) {
-      if (entry) this.store.delete(fullKey)
+      if (entry) {
+        this.totalBytes -= this.entryByteSize(fullKey, entry.value)
+        this.store.delete(fullKey)
+      }
       return false
     }
     return true
@@ -157,20 +199,10 @@ export class MemoryCache {
     keysCount?: number
     memoryUsage?: string
   }> {
-    const now = Date.now()
-    let validKeys = 0
-    let totalBytes = 0
-    for (const [key, entry] of this.store.entries()) {
-      if (entry.expiresAt > now) {
-        validKeys++
-        totalBytes += Buffer.byteLength(JSON.stringify(entry.value)) + Buffer.byteLength(key)
-      }
-    }
-    
     return {
       connected: true,
-      keysCount: validKeys,
-      memoryUsage: `${(totalBytes / 1024).toFixed(2)}KB`
+      keysCount: this.store.size,
+      memoryUsage: `${(this.totalBytes / 1024).toFixed(2)}KB`
     }
   }
 
@@ -180,6 +212,7 @@ export class MemoryCache {
       this.cleanupInterval = null
     }
     this.store.clear()
+    this.totalBytes = 0
   }
 }
 
