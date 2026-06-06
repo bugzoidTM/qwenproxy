@@ -4,7 +4,7 @@
  * Robust JSON parsing utilities
  */
 
-function sanitizeAndBalance(input: string): { result: string; openBraces: number; openBrackets: number } {
+function sanitizeAndBalance(input: string): { result: string; openBraces: number; openBrackets: number; inString: boolean } {
   let out = '';
   let openBraces = 0;
   let openBrackets = 0;
@@ -48,11 +48,12 @@ function sanitizeAndBalance(input: string): { result: string; openBraces: number
       if (char === ']') openBrackets--;
     }
   }
-  return { result: out, openBraces, openBrackets };
+  return { result: out, openBraces, openBrackets, inString };
 }
 
-function closeBraces(input: string, openBraces: number, openBrackets: number): string {
+function closeBraces(input: string, openBraces: number, openBrackets: number, inString: boolean = false): string {
   let out = input;
+  if (inString) out += '"';
   if (openBrackets > 0) out += ']'.repeat(openBrackets);
   if (openBraces > 0) out += '}'.repeat(openBraces);
   return out;
@@ -79,7 +80,7 @@ export function robustParseJSON(str: string): any {
     cleaned = cleaned.slice(0, -1).trim();
   }
 
-  const { result: fixedJson, openBraces, openBrackets } = sanitizeAndBalance(cleaned);
+  const { result: fixedJson, openBraces, openBrackets, inString } = sanitizeAndBalance(cleaned);
   let lastBalancedIndex = -1;
 
   { let ob = 0, bk = 0, ins = false, esc = false;
@@ -99,15 +100,15 @@ export function robustParseJSON(str: string): any {
   let tempJson = fixedJson;
   if (lastBalancedIndex !== -1 && (openBraces !== 0 || openBrackets !== 0 || fixedJson.length > lastBalancedIndex + 1)) {
     tempJson = fixedJson.substring(0, lastBalancedIndex + 1);
-  } else if (openBraces > 0 || openBrackets > 0) {
-    tempJson = closeBraces(fixedJson, openBraces, openBrackets);
+  } else if (openBraces > 0 || openBrackets > 0 || inString) {
+    tempJson = closeBraces(fixedJson, openBraces, openBrackets, inString);
   }
 
   try { return JSON.parse(tempJson); } catch (e) {
     let aggressive = fixedJson.trim();
     if (aggressive.endsWith(',')) aggressive = aggressive.slice(0, -1);
-    const { result: aggFixed, openBraces: ob, openBrackets: bk } = sanitizeAndBalance(aggressive);
-  try { return JSON.parse(closeBraces(aggFixed, ob, bk)); } catch {
+    const { result: aggFixed, openBraces: ob, openBrackets: bk, inString: aggInString } = sanitizeAndBalance(aggressive);
+  try { return JSON.parse(closeBraces(aggFixed, ob, bk, aggInString)); } catch {
     return null;
   }
 }

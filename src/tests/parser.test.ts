@@ -54,7 +54,7 @@ test('StreamingToolParser: flush partial content', () => {
 test('StreamingToolParser: robust parsing of malformed JSON', () => {
   const parser = new StreamingToolParser();
   
-  const res = parser.feed('<tool_call>{"name": "broken", "arguments": {"a": 1</tool_call>');
+  const res = parser.feed('<tool_call>{"name": "broken", "arguments": {"a": 1}</tool_call>');
   assert.strictEqual(res.toolCalls.length, 1);
   assert.strictEqual(res.toolCalls[0].name, 'broken');
   assert.deepStrictEqual(res.toolCalls[0].arguments, { a: 1 });
@@ -86,4 +86,42 @@ test('StreamingToolParser: handles multiple tool calls in array format', () => {
   assert.strictEqual(result.toolCalls[0].name, 'bash');
   assert.strictEqual(result.toolCalls[1].name, 'read');
   assert.strictEqual(result.toolCalls[0].arguments.command, 'ls');
+});
+
+test('StreamingToolParser: double-escaped quotes in JSON', () => {
+  const parser = new StreamingToolParser();
+  
+  const input = '<tool_call>{\\"name\\": \\"edit\\", \\"arguments\\": {\\"filePath\\": \\"/tmp/test.txt\\", \\"content\\": \\"hello\\"}}</tool_call>';
+  const res = parser.feed(input);
+  assert.strictEqual(res.toolCalls.length, 1);
+  assert.strictEqual(res.toolCalls[0].name, 'edit');
+  assert.strictEqual(res.toolCalls[0].arguments.filePath, '/tmp/test.txt');
+});
+
+test('StreamingToolParser: double-escaped quotes in XML parameters', () => {
+  const parser = new StreamingToolParser();
+  
+  const input = '<tool_call>\n<name>write</name>\n<parameter name=\\"content\\">&lt;div&gt;hello &amp; world&lt;/div&gt;</parameter>\n</tool_call>';
+  const res = parser.feed(input);
+  assert.strictEqual(res.toolCalls.length, 1);
+  assert.strictEqual(res.toolCalls[0].name, 'write');
+  assert.strictEqual(res.toolCalls[0].arguments.content, '<div>hello & world</div>');
+});
+
+test('StreamingToolParser: truncated JSON with unclosed string', () => {
+  const parser = new StreamingToolParser();
+  
+  const res = parser.feed('<tool_call>{"name": "bash", "arguments": {"command": "echo hello</tool_call>');
+  assert.strictEqual(res.toolCalls.length, 1);
+  assert.strictEqual(res.toolCalls[0].name, 'bash');
+  assert.strictEqual(typeof res.toolCalls[0].arguments.command, 'string');
+});
+
+test('StreamingToolParser: flush double-escaped tool call', () => {
+  const parser = new StreamingToolParser();
+  
+  parser.feed('<tool_call>{\\"name\\": \\"recover\\",\\"arguments\\": {\\"a\\": \\"val');
+  const flushed = parser.flush();
+  assert.strictEqual(flushed.toolCalls.length, 1);
+  assert.strictEqual(flushed.toolCalls[0].name, 'recover');
 });

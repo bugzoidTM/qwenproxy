@@ -30,6 +30,29 @@ function decodeXmlEntities(value: string): string {
     .replace(/&amp;/g, '&');
 }
 
+function unescapeDoubleEscaped(content: string): string {
+  const trimmed = content.trim();
+  if (!trimmed) return content;
+  
+  const isJsonLike = trimmed.startsWith('{') || trimmed.startsWith('[');
+  const isXmlLike = trimmed.startsWith('<');
+  
+  if (!isJsonLike && !isXmlLike) return content;
+  
+  const firstQuoteIdx = trimmed.indexOf('"');
+  if (firstQuoteIdx === -1) return content;
+  
+  const firstEscapedQuoteIdx = trimmed.indexOf('\\"');
+  
+  if (firstEscapedQuoteIdx !== -1 && (firstQuoteIdx === -1 || firstEscapedQuoteIdx < firstQuoteIdx)) {
+    return content
+      .replace(/\\"/g, '"')
+      .replace(/\\\\/g, '\\');
+  }
+  
+  return content;
+}
+
 function coerceParameterValue(rawValue: string): unknown {
   const value = decodeXmlEntities(rawValue.trim());
   if (value === 'true') return true;
@@ -330,9 +353,8 @@ export class StreamingToolParser {
   // ─── Internal Methods ──────────────────────────────────────────────────────
 
   private processToolContent(content: string, result: ParserResult): void {
-    const t = content.trim();
+    let t = content.trim();
     if (!t) {
-      // Empty tool call - malformed. Restore lead-in if possible.
       logger.warn('[parser] Dropping empty tool call block');
       if (this.emittedToolCallCount === 0 && this.pendingLeadIn.trim().length > 0) {
         result.text += this.pendingLeadIn;
@@ -341,7 +363,8 @@ export class StreamingToolParser {
       return;
     }
 
-    // 1) Try Hermes-style XML <parameter> format first
+    t = unescapeDoubleEscaped(t);
+
     const xmlParsed = parseXmlParameterToolCall(t, this.currentOpenTag, this.tools);
     if (xmlParsed) {
       result.toolCalls.push({
@@ -404,8 +427,9 @@ export class StreamingToolParser {
   }
 
   private tryRecoverToolCall(block: string): ParsedToolCall | null {
-    // Try full parse first
-    const xmlParsed = parseXmlParameterToolCall(block, this.currentOpenTag, this.tools);
+    const unescaped = unescapeDoubleEscaped(block);
+    
+    const xmlParsed = parseXmlParameterToolCall(unescaped, this.currentOpenTag, this.tools);
     if (xmlParsed) {
       return {
         id: `call_${crypto.randomUUID()}`,
@@ -414,8 +438,7 @@ export class StreamingToolParser {
       };
     }
 
-    // Try recoverable (unclosed parameters)
-    const recovered = parseRecoverableXmlToolCall(block, this.currentOpenTag, this.tools);
+    const recovered = parseRecoverableXmlToolCall(unescaped, this.currentOpenTag, this.tools);
     if (recovered) {
       return {
         id: `call_${crypto.randomUUID()}`,
@@ -424,11 +447,10 @@ export class StreamingToolParser {
       };
     }
 
-    // Try JSON (single or multiple)
-    const jsonParsed = this.parseToolContent(block);
+    const jsonParsed = this.parseToolContent(unescaped);
     if (jsonParsed.length > 0) {
       const first = jsonParsed[0];
-      const attrName = extractToolName(this.currentOpenTag, block);
+      const attrName = extractToolName(this.currentOpenTag, unescaped);
       if (attrName && !first.name) first.name = attrName;
       if (first.name) return first;
     }
