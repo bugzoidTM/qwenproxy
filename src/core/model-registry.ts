@@ -58,12 +58,14 @@ export function setModelContextWindow(modelId: string, contextWindow: number): v
   modelContextWindows[modelId] = contextWindow
 }
 
-export function getModelContextWindow(modelId: string): number {
+export function getModelContextWindow(modelId?: string): number {
+  if (!modelId) return defaultContextWindow
   const baseId = modelId.replace('-no-thinking', '')
   return modelContextWindows[baseId] ?? defaultContextWindow
 }
 
-export function getModelTokenDivisor(modelId: string): number {
+export function getModelTokenDivisor(modelId?: string): number {
+  if (!modelId) return defaultTokenDivisor
   const baseId = modelId.replace('-no-thinking', '')
   return modelTokenDivisors[baseId] ?? defaultTokenDivisor
 }

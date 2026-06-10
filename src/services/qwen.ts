@@ -1,7 +1,6 @@
 import { getQwenHeaders, getBasicHeaders } from './playwright.js';
 import { MAX_PAYLOAD_SIZE } from '../core/model-registry.js';
 import crypto from 'crypto';
-import { gzipSync } from 'zlib';
 
 const CACHED_TIMEZONE = new Date().toString().split(' (')[0];
 const BASE_TIMEOUT_MS = 120000;
@@ -134,8 +133,32 @@ async function createRealQwenChat(header: Record<string, string>): Promise<strin
     signal: AbortSignal.timeout(30000),
   });
 
-  if (!response.ok) throw new Error(`Failed to create chat: ${response.status}`);
+  if (!response.ok) {
+    const errText = await response.text().catch(() => '');
+    if (response.status === 429) {
+      throw new QwenUpstreamError(
+        'Qwen upstream error: RateLimited: Too many requests.',
+        'RateLimited',
+        429
+      );
+    }
+    throw new Error(`Failed to create chat: ${response.status} - ${errText}`);
+  }
   const json = await response.json();
+  if (json && json.success === false) {
+    const code = json.data?.code || json.code || 'UpstreamError';
+    const details = json.data?.details || json.message || 'Qwen returned an error';
+    const wait = json.data?.num !== undefined
+      ? ` Wait about ${json.data.num} hour(s) before trying again.`
+      : '';
+    let status = 502;
+    if (code === 'RateLimited') status = 429;
+    throw new QwenUpstreamError(
+      `Qwen upstream error: ${code}: ${details}.${wait}`,
+      code,
+      status
+    );
+  }
   const chatId = json.chat_id || json.id || json.data?.chat_id || json.data?.id;
   if (!chatId) throw new Error(`Unexpected chat response: ${JSON.stringify(json).slice(0, 200)}`);
   return chatId;
@@ -485,8 +508,6 @@ export async function createQwenStream(
   const payloadMB = payloadSize / (1024 * 1024);
   const timeoutMs = BASE_TIMEOUT_MS + Math.ceil(payloadMB * TIMEOUT_PER_MB);
 
-  const compressedBody = gzipSync(Buffer.from(payloadJson));
-
   const url = `https://chat.qwen.ai/api/v2/chat/completions?chat_id=${chatId}`;
   const controller = new AbortController();
   const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
@@ -496,7 +517,6 @@ export async function createQwenStream(
       'accept': 'application/json',
       'accept-language': 'pt-BR,pt;q=0.9',
       'content-type': 'application/json',
-      'content-encoding': 'gzip',
       'cookie': chatHeaders['cookie'],
       'origin': 'https://chat.qwen.ai',
       'referer': `https://chat.qwen.ai/c/${chatId}`,
@@ -512,7 +532,7 @@ export async function createQwenStream(
       'bx-umidtoken': chatHeaders['bx-umidtoken'] || '',
       ...getClientHintsHeaders(),
     },
-    body: compressedBody,
+    body: payloadJson,
     signal: controller.signal
   });
   clearTimeout(timeoutId);
@@ -533,7 +553,6 @@ export async function createQwenStream(
             'accept': 'application/json',
             'accept-language': 'pt-BR,pt;q=0.9',
             'content-type': 'application/json',
-            'content-encoding': 'gzip',
             'cookie': freshHeaders['cookie'],
             'origin': 'https://chat.qwen.ai',
             'referer': `https://chat.qwen.ai/c/${chatId}`,
@@ -549,7 +568,7 @@ export async function createQwenStream(
             'bx-umidtoken': freshHeaders['bx-umidtoken'] || '',
             ...getClientHintsHeaders(),
           },
-          body: compressedBody,
+          body: payloadJson,
           signal: retryController.signal
         });
         clearTimeout(retryTimeoutId);

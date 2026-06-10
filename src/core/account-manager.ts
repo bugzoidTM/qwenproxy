@@ -1,4 +1,4 @@
-import { QwenAccount, loadAccounts } from './accounts.js'
+import { QwenAccount, loadAccounts, updateAccountCooldown } from './accounts.js'
 import { config } from './config.js'
 
 let currentIndex = 0
@@ -21,6 +21,20 @@ function getCachedAccounts(): QwenAccount[] {
   if (!accountsCache || (now - accountsCacheTimestamp) > ACCOUNTS_CACHE_TTL) {
     accountsCache = loadAccounts()
     accountsCacheTimestamp = now
+
+    // Sync memory cooldowns map from database values
+    for (const account of accountsCache) {
+      if (account.cooldown_until && account.cooldown_until > now) {
+        cooldowns.set(account.id, {
+          until: account.cooldown_until,
+          reason: account.cooldown_reason || 'RateLimited',
+        })
+      } else {
+        if (cooldowns.has(account.id)) {
+          cooldowns.delete(account.id)
+        }
+      }
+    }
   }
   return accountsCache
 }
@@ -31,15 +45,35 @@ export function invalidateAccountsCache(): void {
 }
 
 export function markAccountRateLimited(accountId: string, cooldownMs?: number, reason?: string): void {
+  const duration = cooldownMs ?? DEFAULT_COOLDOWN_MS
+  const until = Date.now() + duration
+  const cooldownReason = reason ?? 'RateLimited'
+
   cooldowns.set(accountId, {
-    until: Date.now() + (cooldownMs ?? DEFAULT_COOLDOWN_MS),
-    reason: reason ?? 'RateLimited',
+    until,
+    reason: cooldownReason,
   })
-  console.log(`[AccountManager] Account ${accountId} marked as rate-limited. Cooldown until ${new Date(Date.now() + (cooldownMs ?? DEFAULT_COOLDOWN_MS)).toISOString()}`)
+
+  if (accountId !== 'global') {
+    try {
+      updateAccountCooldown(accountId, until, cooldownReason)
+    } catch (err) {
+      console.error(`[AccountManager] Failed to save cooldown to DB for account ${accountId}:`, (err as Error).message)
+    }
+  }
+
+  console.log(`[AccountManager] Account ${accountId} marked as rate-limited. Cooldown until ${new Date(until).toISOString()}`)
 }
 
 export function clearAccountCooldown(accountId: string): void {
   cooldowns.delete(accountId)
+  if (accountId !== 'global') {
+    try {
+      updateAccountCooldown(accountId, 0, null)
+    } catch (err) {
+      console.error(`[AccountManager] Failed to clear cooldown in DB for account ${accountId}:`, (err as Error).message)
+    }
+  }
 }
 
 export function getAccountCooldownInfo(accountId: string): { onCooldown: boolean; remainingMs: number; reason: string } | null {
@@ -48,6 +82,13 @@ export function getAccountCooldownInfo(accountId: string): { onCooldown: boolean
   const remaining = entry.until - Date.now()
   if (remaining <= 0) {
     cooldowns.delete(accountId)
+    if (accountId !== 'global') {
+      try {
+        updateAccountCooldown(accountId, 0, null)
+      } catch (err) {
+        console.error(`[AccountManager] Failed to clear expired cooldown in DB:`, (err as Error).message)
+      }
+    }
     return null
   }
   return { onCooldown: true, remainingMs: remaining, reason: entry.reason }
