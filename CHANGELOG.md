@@ -1,3 +1,10 @@
+## [1.3.1](https://github.com/pedrofariasx/qwenproxy/compare/v1.3.0...v1.3.1) (2026-06-10)
+
+
+### Bug Fixes
+
+* add anti-detection stealth, full anti-fraud headers, and TMD challenge retry ([76d007f](https://github.com/pedrofariasx/qwenproxy/commit/76d007f1944501ff80c1c3f1ae9749ec82efbde2))
+
 # [1.3.0](https://github.com/pedrofariasx/qwenproxy/compare/v1.2.3...v1.3.0) (2026-06-07)
 
 
