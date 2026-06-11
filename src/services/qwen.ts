@@ -1,4 +1,4 @@
-import { getQwenHeaders, getBasicHeaders, getGuestHeaders } from './playwright.js';
+import { getQwenHeaders, getBasicHeaders, getGuestHeaders, getPageForAccount, browserFetch, browserStreamFetch, CHROME_CLIENT_HINTS, CHROME_UA } from './playwright.js';
 import { MAX_PAYLOAD_SIZE } from '../core/model-registry.js';
 import { markAccountRateLimited } from '../core/account-manager.js';
 import crypto from 'crypto';
@@ -11,7 +11,7 @@ const sleep = (ms: number) => new Promise(r => setTimeout(r, ms));
 
 function getClientHintsHeaders(): Record<string, string> {
   return {
-    'sec-ch-ua': '"Chromium";v="130", "Google Chrome";v="130", "Not?A_Brand";v="99"',
+    'sec-ch-ua': CHROME_CLIENT_HINTS,
     'sec-ch-ua-mobile': '?0',
     'sec-ch-ua-platform': '"Windows"',
   };
@@ -106,7 +106,58 @@ async function getBasicQwenHeaders(accountId?: string): Promise<Record<string, s
   };
 }
 
-async function createRealQwenChat(header: Record<string, string>): Promise<string> {
+async function createRealQwenChat(header: Record<string, string>, accountId?: string): Promise<string> {
+  const page = getPageForAccount(accountId);
+  const body = JSON.stringify({
+    title: 'Nova Conversa',
+    models: ['qwen3.7-plus'],
+    chat_mode: 'normal',
+    chat_type: 't2t',
+    timestamp: Date.now(),
+    project_id: '',
+  });
+
+  const pageUrl = page?.url() || '';
+  const isOnQwenOrigin = pageUrl.includes('chat.qwen.ai');
+
+  if (page && !page.isClosed() && isOnQwenOrigin) {
+    try {
+      const result = await browserFetch(page, 'https://chat.qwen.ai/api/v2/chats/new', {
+        method: 'POST',
+        headers: {
+          'accept': 'application/json, text/plain, */*',
+          'content-type': 'application/json',
+          'x-request-id': crypto.randomUUID(),
+          'timezone': CACHED_TIMEZONE,
+        },
+        body,
+        timeoutMs: 30000,
+      });
+
+      if (result.status === 429) {
+        throw new QwenUpstreamError('Qwen upstream error: RateLimited: Too many requests.', 'RateLimited', 429);
+      }
+      if (!result.status || result.status >= 400) {
+        throw new Error(`Failed to create chat: ${result.status} - ${result.body}`);
+      }
+      const json = JSON.parse(result.body);
+      if (json && json.success === false) {
+        const code = json.data?.code || json.code || 'UpstreamError';
+        const details = json.data?.details || json.message || 'Qwen returned an error';
+        const wait = json.data?.num !== undefined ? ` Wait about ${json.data.num} hour(s) before trying again.` : '';
+        let status = 502;
+        if (code === 'RateLimited') status = 429;
+        throw new QwenUpstreamError(`Qwen upstream error: ${code}: ${details}.${wait}`, code, status);
+      }
+      const chatId = json.chat_id || json.id || json.data?.chat_id || json.data?.id;
+      if (!chatId) throw new Error(`Unexpected chat response: ${JSON.stringify(json).slice(0, 200)}`);
+      return chatId;
+    } catch (err: any) {
+      if (err instanceof QwenUpstreamError) throw err;
+      console.warn('[WarmPool] browserFetch failed for chat creation, falling back to Node.js fetch:', err.message);
+    }
+  }
+
   const response = await fetch('https://chat.qwen.ai/api/v2/chats/new', {
     method: 'POST',
     headers: {
@@ -123,25 +174,14 @@ async function createRealQwenChat(header: Record<string, string>): Promise<strin
       'bx-umidtoken': header['bx-umidtoken'] || '',
       ...getClientHintsHeaders(),
     },
-    body: JSON.stringify({
-      title: 'Nova Conversa',
-      models: ['qwen3.7-plus'],
-      chat_mode: 'normal',
-      chat_type: 't2t',
-      timestamp: Date.now(),
-      project_id: '',
-    }),
+    body,
     signal: AbortSignal.timeout(30000),
   });
 
   if (!response.ok) {
     const errText = await response.text().catch(() => '');
     if (response.status === 429) {
-      throw new QwenUpstreamError(
-        'Qwen upstream error: RateLimited: Too many requests.',
-        'RateLimited',
-        429
-      );
+      throw new QwenUpstreamError('Qwen upstream error: RateLimited: Too many requests.', 'RateLimited', 429);
     }
     throw new Error(`Failed to create chat: ${response.status} - ${errText}`);
   }
@@ -149,16 +189,10 @@ async function createRealQwenChat(header: Record<string, string>): Promise<strin
   if (json && json.success === false) {
     const code = json.data?.code || json.code || 'UpstreamError';
     const details = json.data?.details || json.message || 'Qwen returned an error';
-    const wait = json.data?.num !== undefined
-      ? ` Wait about ${json.data.num} hour(s) before trying again.`
-      : '';
+    const wait = json.data?.num !== undefined ? ` Wait about ${json.data.num} hour(s) before trying again.` : '';
     let status = 502;
     if (code === 'RateLimited') status = 429;
-    throw new QwenUpstreamError(
-      `Qwen upstream error: ${code}: ${details}.${wait}`,
-      code,
-      status
-    );
+    throw new QwenUpstreamError(`Qwen upstream error: ${code}: ${details}.${wait}`, code, status);
   }
   const chatId = json.chat_id || json.id || json.data?.chat_id || json.data?.id;
   if (!chatId) throw new Error(`Unexpected chat response: ${JSON.stringify(json).slice(0, 200)}`);
@@ -181,10 +215,14 @@ async function refillPoolForAccount(accountId: string) {
     return;
   }
 
-  const creationPromises = Array.from({ length: need }, async () => {
+  const acctId = accountId === 'global' ? undefined : accountId;
+  for (let i = 0; i < need; i++) {
+    if (i > 0) {
+      await sleep(800 + Math.floor(Math.random() * 2200));
+    }
     try {
-      const chatId = await createRealQwenChat(headers);
-      return { chatId, headers, accountId, timestamp: Date.now() };
+      const chatId = await createRealQwenChat(headers, acctId);
+      pool.push({ chatId, headers, accountId, timestamp: Date.now() });
     } catch (err: any) {
       if (err instanceof QwenUpstreamError) {
         if (err.upstreamCode === 'RateLimited' || err.upstreamStatus === 429) {
@@ -192,16 +230,11 @@ async function refillPoolForAccount(accountId: string) {
           const cooldownMs = hourHint ? parseInt(hourHint[1]) * 60 * 60 * 1000 : undefined;
           markAccountRateLimited(accountId, cooldownMs, 'RateLimited');
           console.warn(`[WarmPool] Account ${accountId} rate-limited during chat creation. Marked for cooldown.`);
+          break;
         }
       }
       console.error(`[WarmPool] chat creation failed for ${accountId}:`, (err as Error).message);
-      return null;
     }
-  });
-
-  const results = await Promise.all(creationPromises);
-  for (const entry of results) {
-    if (entry) pool.push(entry);
   }
 }
 
@@ -304,6 +337,32 @@ export async function disableNativeTools(accountId?: string): Promise<void> {
     };
 
     console.log(`[Qwen] Disabling native tools for ${cacheKey}...`);
+    const page = getPageForAccount(accountId);
+    if (page && !page.isClosed() && page.url().includes('chat.qwen.ai')) {
+      try {
+        const result = await browserFetch(page, 'https://chat.qwen.ai/api/v2/users/user/settings/update', {
+          method: 'POST',
+          headers: {
+            'accept': 'application/json, text/plain, */*',
+            'content-type': 'application/json',
+            'x-request-id': crypto.randomUUID(),
+            'timezone': CACHED_TIMEZONE,
+          },
+          body: JSON.stringify(payload),
+          timeoutMs: 30000,
+        });
+        if (result.status && result.status < 400) {
+          console.log(`[Qwen] Native tools disabled successfully for ${cacheKey}.`);
+          nativeToolsDisabled.add(cacheKey);
+          return;
+        }
+        console.error(`[Qwen] Failed to disable native tools for ${cacheKey}: ${result.status} - ${result.body}`);
+        return;
+      } catch (err: any) {
+        console.warn('[Qwen] browserFetch failed for disableNativeTools, falling back:', err.message);
+      }
+    }
+
     const controller = new AbortController();
     const timeoutId = setTimeout(() => controller.abort(), 30000);
     const response = await fetch('https://chat.qwen.ai/api/v2/users/user/settings/update', {
@@ -346,6 +405,27 @@ export async function fetchQwenModels(accountId?: string): Promise<any[]> {
     return cachedModels;
   }
 
+  const page = getPageForAccount(accountId);
+  if (page && !page.isClosed() && page.url().includes('chat.qwen.ai')) {
+    try {
+      const result = await browserFetch(page, 'https://chat.qwen.ai/api/models', {
+        method: 'GET',
+        headers: {
+          'accept': 'application/json, text/plain, */*',
+          'x-request-id': crypto.randomUUID(),
+          'timezone': CACHED_TIMEZONE,
+          'source': 'web',
+        },
+        timeoutMs: 30000,
+      });
+      if (result.status && result.status < 400) {
+        return processModelsJson(JSON.parse(result.body));
+      }
+    } catch (err: any) {
+      console.warn('[Qwen] browserFetch failed for models, falling back:', err.message);
+    }
+  }
+
   const { cookie, userAgent, bxV, bxUa, bxUmidtoken } = await getBasicHeaders(accountId);
 
   const response = await fetch('https://chat.qwen.ai/api/models', {
@@ -370,6 +450,10 @@ export async function fetchQwenModels(accountId?: string): Promise<any[]> {
   }
 
   const json = await response.json();
+  return processModelsJson(json);
+}
+
+function processModelsJson(json: any): any[] {
   if (json.data && Array.isArray(json.data)) {
     const models = json.data.map((m: any) => ({
       id: m.id,
@@ -390,7 +474,7 @@ export async function fetchQwenModels(accountId?: string): Promise<any[]> {
     ];
 
     cachedModels = extendedModels;
-    lastModelsFetch = now;
+    lastModelsFetch = Date.now();
     return extendedModels;
   }
 
@@ -420,36 +504,53 @@ export async function createQwenStream(
 
   if (accountId === 'guest') {
     chatHeaders = await getGuestHeaders();
-    const response = await fetch('https://chat.qwen.ai/api/v2/chats/new', {
-      method: 'POST',
-      headers: {
-        'accept': 'application/json, text/plain, */*',
-        'accept-language': 'pt-BR,pt;q=0.9',
-        'content-type': 'application/json',
-        cookie: chatHeaders['cookie'],
-        origin: 'https://chat.qwen.ai',
-        referer: 'https://chat.qwen.ai/c/guest',
-        'user-agent': chatHeaders['user-agent'],
-        'x-request-id': crypto.randomUUID(),
-        'bx-v': chatHeaders['bx-v'],
-        'bx-ua': chatHeaders['bx-ua'],
-        'bx-umidtoken': chatHeaders['bx-umidtoken'],
-        ...getClientHintsHeaders(),
-      },
-      body: JSON.stringify({
-        title: 'Guest Chat',
-        models: [modelId.replace('-no-thinking', '')],
-        chat_mode: 'guest',
-        chat_type: 't2t',
-        timestamp: Date.now(),
-        project_id: '',
-      }),
-      signal: AbortSignal.timeout(30000),
+    const guestPage = getPageForAccount('guest');
+    const guestBody = JSON.stringify({
+      title: 'Guest Chat',
+      models: [modelId.replace('-no-thinking', '')],
+      chat_mode: 'guest',
+      chat_type: 't2t',
+      timestamp: Date.now(),
+      project_id: '',
     });
-    if (!response.ok) throw new Error(`Failed to create guest chat: ${response.status}`);
-    const json = await response.json();
-    chatId = json.chat_id || json.id || json.data?.chat_id || json.data?.id;
-    if (!chatId) throw new Error(`Unexpected guest chat response: ${JSON.stringify(json).slice(0, 200)}`);
+
+    if (guestPage && !guestPage.isClosed()) {
+      try {
+        const result = await browserFetch(guestPage, 'https://chat.qwen.ai/api/v2/chats/new', {
+          method: 'POST',
+          headers: { 'accept': 'application/json, text/plain, */*', 'content-type': 'application/json', 'x-request-id': crypto.randomUUID(), 'timezone': CACHED_TIMEZONE },
+          body: guestBody,
+          timeoutMs: 30000,
+        });
+        if (!result.status || result.status >= 400) throw new Error(`Failed to create guest chat: ${result.status}`);
+        const json = JSON.parse(result.body);
+        chatId = json.chat_id || json.id || json.data?.chat_id || json.data?.id;
+        if (!chatId) throw new Error(`Unexpected guest chat response: ${JSON.stringify(json).slice(0, 200)}`);
+      } catch (err: any) {
+        console.warn('[Qwen] browserFetch guest chat failed, falling back:', err.message);
+        const response = await fetch('https://chat.qwen.ai/api/v2/chats/new', {
+          method: 'POST',
+          headers: { 'accept': 'application/json, text/plain, */*', 'content-type': 'application/json', cookie: chatHeaders['cookie'], origin: 'https://chat.qwen.ai', referer: 'https://chat.qwen.ai/c/guest', 'user-agent': chatHeaders['user-agent'], 'x-request-id': crypto.randomUUID(), 'bx-v': chatHeaders['bx-v'], 'bx-ua': chatHeaders['bx-ua'], 'bx-umidtoken': chatHeaders['bx-umidtoken'], ...getClientHintsHeaders() },
+          body: guestBody,
+          signal: AbortSignal.timeout(30000),
+        });
+        if (!response.ok) throw new Error(`Failed to create guest chat: ${response.status}`);
+        const json = await response.json();
+        chatId = json.chat_id || json.id || json.data?.chat_id || json.data?.id;
+        if (!chatId) throw new Error(`Unexpected guest chat response: ${JSON.stringify(json).slice(0, 200)}`);
+      }
+    } else {
+      const response = await fetch('https://chat.qwen.ai/api/v2/chats/new', {
+        method: 'POST',
+        headers: { 'accept': 'application/json, text/plain, */*', 'content-type': 'application/json', cookie: chatHeaders['cookie'], origin: 'https://chat.qwen.ai', referer: 'https://chat.qwen.ai/c/guest', 'user-agent': chatHeaders['user-agent'], 'x-request-id': crypto.randomUUID(), 'bx-v': chatHeaders['bx-v'], 'bx-ua': chatHeaders['bx-ua'], 'bx-umidtoken': chatHeaders['bx-umidtoken'], ...getClientHintsHeaders() },
+        body: guestBody,
+        signal: AbortSignal.timeout(30000),
+      });
+      if (!response.ok) throw new Error(`Failed to create guest chat: ${response.status}`);
+      const json = await response.json();
+      chatId = json.chat_id || json.id || json.data?.chat_id || json.data?.id;
+      if (!chatId) throw new Error(`Unexpected guest chat response: ${JSON.stringify(json).slice(0, 200)}`);
+    }
   } else {
     let chatEntry: WarmPoolEntry;
     try {
@@ -555,6 +656,66 @@ export async function createQwenStream(
   const timeoutMs = BASE_TIMEOUT_MS + Math.ceil(payloadMB * TIMEOUT_PER_MB);
 
   const url = `https://chat.qwen.ai/api/v2/chat/completions?chat_id=${chatId}`;
+
+  const completionHeaders: Record<string, string> = {
+    'accept': 'text/event-stream',
+    'content-type': 'application/json',
+    'x-request-id': crypto.randomUUID(),
+    'timezone': CACHED_TIMEZONE,
+  };
+
+  const page = getPageForAccount(accountId);
+  if (page && !page.isClosed() && page.url().includes('chat.qwen.ai')) {
+    try {
+      const browserResult = await browserStreamFetch(page, url, {
+        method: 'POST',
+        headers: completionHeaders,
+        body: payloadJson,
+        timeoutMs,
+      });
+
+      if (browserResult.contentType.includes('text/event-stream') && browserResult.status < 400) {
+        const controller = new AbortController();
+        return { stream: browserResult.stream, headers: chatHeaders, uiSessionId: chatId, controller, accountId: accountId || 'guest' };
+      }
+
+      if (browserResult.body) {
+        const peekText = browserResult.body;
+        if (peekText.includes('FAIL_SYS_USER_VALIDATE') || peekText.includes('_____tmd_____') || peekText.includes('RGV587_ERROR')) {
+          console.warn('[Qwen] TMD challenge detected via browser, refreshing headers and retrying...');
+          try {
+            const { headers: freshHeaders } = await getQwenHeaders(true, accountId);
+            await sleep(500 + Math.floor(Math.random() * 1000));
+            const retryResult = await browserStreamFetch(page, url, {
+              method: 'POST',
+              headers: completionHeaders,
+              body: payloadJson,
+              timeoutMs,
+            });
+            if (retryResult.contentType.includes('text/event-stream') && retryResult.status < 400) {
+              const controller = new AbortController();
+              return { stream: retryResult.stream, headers: freshHeaders, uiSessionId: chatId, controller, accountId: accountId || 'guest' };
+            }
+            if (retryResult.body && (retryResult.body.includes('FAIL_SYS_USER_VALIDATE') || retryResult.body.includes('_____tmd_____'))) {
+              throw new QwenUpstreamError('Qwen TMD challenge persists after header refresh.', 'FAIL_SYS_USER_VALIDATE', 403);
+            }
+            if (retryResult.body) {
+              handleErrorBody(retryResult.body, retryResult.status);
+            }
+          } catch (retryErr) {
+            if (retryErr instanceof QwenUpstreamError) throw retryErr;
+            console.error('[Qwen] Browser TMD retry failed:', (retryErr as Error).message);
+          }
+          throw new QwenUpstreamError('Qwen TMD anti-bot challenge detected. Headers were refreshed but the challenge persists.', 'FAIL_SYS_USER_VALIDATE', 403);
+        }
+        handleErrorBody(peekText, browserResult.status);
+      }
+    } catch (browserErr: any) {
+      if (browserErr instanceof QwenUpstreamError || browserErr instanceof RetryableQwenStreamError) throw browserErr;
+      console.warn('[Qwen] Browser stream fetch failed, falling back to Node.js:', browserErr.message);
+    }
+  }
+
   const controller = new AbortController();
   const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
   const response = await fetch(url, {
@@ -626,34 +787,10 @@ export async function createQwenStream(
 
         const retryPeek = await retryResponse.clone().text().catch(() => '');
         if (retryPeek.includes('FAIL_SYS_USER_VALIDATE') || retryPeek.includes('_____tmd_____')) {
-          throw new QwenUpstreamError(
-            'Qwen TMD challenge persists after header refresh. The account may need manual captcha resolution.',
-            'FAIL_SYS_USER_VALIDATE',
-            403,
-          );
+          throw new QwenUpstreamError('Qwen TMD challenge persists after header refresh. The account may need manual captcha resolution.', 'FAIL_SYS_USER_VALIDATE', 403);
         }
 
         if (retryResponse.ok && retryResponse.body) {
-          try {
-            const errorJson = JSON.parse(retryPeek);
-            if (errorJson && (errorJson.success === false || errorJson.error)) {
-              const code = errorJson.data?.code || errorJson.code || 'UpstreamError';
-              const details = errorJson.data?.details || errorJson.message || errorJson.error?.message || 'Qwen returned an error';
-              const wait = errorJson.data?.num !== undefined
-                ? ` Wait about ${errorJson.data.num} hour(s) before trying again.`
-                : '';
-              let status = 502;
-              if (code === 'RateLimited') status = 429;
-              
-              throw new QwenUpstreamError(
-                `Qwen upstream error: ${code}: ${details}.${wait}`,
-                code,
-                status,
-              );
-            }
-          } catch (e) {
-            if (e instanceof QwenUpstreamError) throw e;
-          }
           return { stream: retryResponse.body, headers: freshHeaders, uiSessionId: chatId, controller: retryController, accountId: accountId || 'guest' };
         }
       } catch (retryErr) {
@@ -661,32 +798,9 @@ export async function createQwenStream(
         console.error('[Qwen] TMD retry failed:', (retryErr as Error).message);
       }
 
-      throw new QwenUpstreamError(
-        'Qwen TMD anti-bot challenge detected. Headers were refreshed but the challenge persists.',
-        'FAIL_SYS_USER_VALIDATE',
-        403,
-      );
+      throw new QwenUpstreamError('Qwen TMD anti-bot challenge detected. Headers were refreshed but the challenge persists.', 'FAIL_SYS_USER_VALIDATE', 403);
     } else {
-      try {
-        const errorJson = JSON.parse(peekText);
-        if (errorJson && (errorJson.success === false || errorJson.error)) {
-          const code = errorJson.data?.code || errorJson.code || 'UpstreamError';
-          const details = errorJson.data?.details || errorJson.message || errorJson.error?.message || 'Qwen returned an error';
-          const wait = errorJson.data?.num !== undefined
-            ? ` Wait about ${errorJson.data.num} hour(s) before trying again.`
-            : '';
-          let status = 502;
-          if (code === 'RateLimited') status = 429;
-          
-          throw new QwenUpstreamError(
-            `Qwen upstream error: ${code}: ${details}.${wait}`,
-            code,
-            status,
-          );
-        }
-      } catch (e) {
-        if (e instanceof QwenUpstreamError) throw e;
-      }
+      handleErrorBody(peekText, response.status);
     }
   }
 
@@ -695,50 +809,53 @@ export async function createQwenStream(
     const contentType = response.headers.get('content-type') || '';
 
     if (contentType.includes('application/json')) {
-      try {
-        const errorJson = JSON.parse(errText);
-        if (errorJson?.data?.details?.includes('chat is in progress') ||
-            errorJson?.data?.details?.includes('The chat is in progress')) {
-          const retryAfterMs = 2000 + Math.floor(Math.random() * 2000);
-          throw new RetryableQwenStreamError(
-            `Qwen: ${errorJson.data.details}`,
-            retryAfterMs,
-          );
-        }
-        if (errorJson?.success === false) {
-          const code = errorJson.data?.code || errorJson.code || 'UpstreamError';
-          const details = errorJson.data?.details || errorJson.message || 'Qwen returned an error';
-          const wait = errorJson.data?.num !== undefined
-            ? ` Wait about ${errorJson.data.num} hour(s) before trying again.`
-            : '';
-          let status: number;
-          if (code === 'RateLimited') status = 429;
-          else if (code === 'Not_Found') status = 404;
-          else if (code === 'UpstreamError') status = 502;
-          else status = 502;
-          throw new QwenUpstreamError(
-            `Qwen upstream error: ${code}: ${details}.${wait}`,
-            code,
-            status,
-          );
-        }
-        if (errorJson?.data?.details?.includes('is not exist') ||
-            errorJson?.data?.details?.includes('not exist') ||
-            errorJson.data?.details?.includes('does not exist')) {
-          throw new RetryableQwenStreamError(
-            `Qwen: ${errorJson.data.details}`,
-            0,
-          );
-        }
-      } catch (parseOrRetryError) {
-        if (parseOrRetryError instanceof RetryableQwenStreamError ||
-            parseOrRetryError instanceof QwenUpstreamError) {
-          throw parseOrRetryError;
-        }
-      }
+      handleJsonErrorBody(errText);
     }
     throw new Error(`Failed to fetch from Qwen: ${response.status} ${response.statusText} - ${errText}`);
   }
 
   return { stream: response.body, headers: chatHeaders, uiSessionId: chatId, controller, accountId: accountId || 'guest' };
+}
+
+function handleErrorBody(peekText: string, status: number): never {
+  try {
+    const errorJson = JSON.parse(peekText);
+    if (errorJson && (errorJson.success === false || errorJson.error)) {
+      const code = errorJson.data?.code || errorJson.code || 'UpstreamError';
+      const details = errorJson.data?.details || errorJson.message || errorJson.error?.message || 'Qwen returned an error';
+      const wait = errorJson.data?.num !== undefined ? ` Wait about ${errorJson.data.num} hour(s) before trying again.` : '';
+      let errStatus = 502;
+      if (code === 'RateLimited') errStatus = 429;
+      throw new QwenUpstreamError(`Qwen upstream error: ${code}: ${details}.${wait}`, code, errStatus);
+    }
+  } catch (e) {
+    if (e instanceof QwenUpstreamError) throw e;
+  }
+  throw new Error(`Qwen returned status ${status}: ${peekText.slice(0, 500)}`);
+}
+
+function handleJsonErrorBody(errText: string): never {
+  try {
+    const errorJson = JSON.parse(errText);
+    if (errorJson?.data?.details?.includes('chat is in progress') || errorJson?.data?.details?.includes('The chat is in progress')) {
+      const retryAfterMs = 2000 + Math.floor(Math.random() * 2000);
+      throw new RetryableQwenStreamError(`Qwen: ${errorJson.data.details}`, retryAfterMs);
+    }
+    if (errorJson?.success === false) {
+      const code = errorJson.data?.code || errorJson.code || 'UpstreamError';
+      const details = errorJson.data?.details || errorJson.message || 'Qwen returned an error';
+      const wait = errorJson.data?.num !== undefined ? ` Wait about ${errorJson.data.num} hour(s) before trying again.` : '';
+      let status: number;
+      if (code === 'RateLimited') status = 429;
+      else if (code === 'Not_Found') status = 404;
+      else status = 502;
+      throw new QwenUpstreamError(`Qwen upstream error: ${code}: ${details}.${wait}`, code, status);
+    }
+    if (errorJson?.data?.details?.includes('is not exist') || errorJson?.data?.details?.includes('not exist') || errorJson.data?.details?.includes('does not exist')) {
+      throw new RetryableQwenStreamError(`Qwen: ${errorJson.data.details}`, 0);
+    }
+  } catch (e) {
+    if (e instanceof RetryableQwenStreamError || e instanceof QwenUpstreamError) throw e;
+  }
+  throw new Error(`Qwen JSON error: ${errText.slice(0, 500)}`);
 }
